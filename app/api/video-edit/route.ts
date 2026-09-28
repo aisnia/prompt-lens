@@ -4,6 +4,7 @@ import { db, operationLogs } from "@/lib/db";
 import { checkRateLimit, RateLimitConfigs } from "@/lib/utils/rate-limit";
 import axios from "axios";
 import { extractR2Key, getSignedUrlFromR2 } from "@/lib/cloudflare/r2";
+import { assertSafeOutboundUrl } from "@/lib/utils/outbound-url";
 
 // 把 R2 公开 URL 转成签名 URL，让自托管 FFmpeg 服务能下载
 async function ensureAccessibleUrl(url: string): Promise<string> {
@@ -153,6 +154,19 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const resolvedFfmpegServiceUrl = (
+      await assertSafeOutboundUrl(ffmpegServiceUrl, { fieldName: "FFmpeg service URL" })
+    ).toString().replace(/\/$/, "");
+    const videoR2Key = extractR2Key(videoUrl);
+    if (videoR2Key) {
+      const ownerPrefix = `uploads/${encodeURIComponent(session.user.id)}/`;
+      if (!videoR2Key.startsWith(ownerPrefix)) {
+        return NextResponse.json({ error: "Media does not belong to the current user" }, { status: 403 });
+      }
+    } else {
+      await assertSafeOutboundUrl(videoUrl, { fieldName: "Video URL" });
+    }
+
     console.log("[video-edit] Processing:", { videoUrl: videoUrl.substring(0, 50), prompt, ffmpegServiceUrl });
 
     // 把 R2 公开 URL 转成签名 URL，确保自托管 FFmpeg 服务能下载
@@ -183,12 +197,12 @@ export async function POST(request: NextRequest) {
     }
 
     const ffmpegResponse = await axios.post(
-      `${ffmpegServiceUrl.replace(/\/$/, "")}${endpoint}`,
+      `${resolvedFfmpegServiceUrl}${endpoint}`,
       {
         videoUrl: accessibleVideoUrl,
         instruction,
       },
-      { timeout: 300000 } // 5 分钟超时，依赖自托管服务的处理能力
+      { timeout: 300000, maxRedirects: 0 } // 5 分钟超时，依赖自托管服务的处理能力
     );
 
     const outputUrl: string = ffmpegResponse.data?.url || ffmpegResponse.data?.outputUrl;

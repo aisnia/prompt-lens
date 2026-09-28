@@ -5,6 +5,7 @@ import { checkRateLimit, RateLimitConfigs } from "@/lib/utils/rate-limit";
 import { AssemblyAI } from "assemblyai";
 import axios from "axios";
 import { extractR2Key, getSignedUrlFromR2 } from "@/lib/cloudflare/r2";
+import { assertSafeOutboundUrl } from "@/lib/utils/outbound-url";
 
 // 将公开 R2 URL 转为签名 URL，否则原样返回
 async function ensureAccessibleUrl(url: string): Promise<string> {
@@ -170,10 +171,24 @@ export async function POST(request: NextRequest) {
       );
     }
 
+    const resolvedFunasrUrl = whisperModelSize === "funasr"
+      ? (await assertSafeOutboundUrl(funasrUrl, { fieldName: "FunASR URL" })).toString().replace(/\/$/, "")
+      : null;
+
+    const mediaR2Key = extractR2Key(mediaUrl);
+    if (mediaR2Key) {
+      const ownerPrefix = `uploads/${encodeURIComponent(session.user.id)}/`;
+      if (!mediaR2Key.startsWith(ownerPrefix)) {
+        return NextResponse.json({ error: "Media does not belong to the current user" }, { status: 403 });
+      }
+    } else {
+      await assertSafeOutboundUrl(mediaUrl, { fieldName: "Media URL" });
+    }
+
     // 将 R2 URL 转换为签名 URL，确保 AssemblyAI / FunASR 能下载
     const accessibleUrl = await ensureAccessibleUrl(mediaUrl);
 
-    console.log(`Starting ${whisperModelSize === "funasr" ? "FunASR" : "AssemblyAI"} transcription for:`, accessibleUrl);
+    console.log(`Starting ${whisperModelSize === "funasr" ? "FunASR" : "AssemblyAI"} transcription for:`, mediaUrl);
 
     // 记录分析开始
     try {
@@ -195,9 +210,9 @@ export async function POST(request: NextRequest) {
       // FunASR 自托管模式
       try {
         const funasrRes = await axios.post(
-          `${funasrUrl}/recognition`,
+          `${resolvedFunasrUrl}/recognition`,
           { audio_url: accessibleUrl },
-          { timeout: 120000 }
+          { timeout: 120000, maxRedirects: 0 }
         );
 
         const funasrData = funasrRes.data;
@@ -264,7 +279,9 @@ export async function POST(request: NextRequest) {
     console.log("Transcription text length:", fullText.length);
 
     // 使用 LLM 进行智能分段
-    const llmApiKey = process.env.DEEPSEEK_API_KEY; // 需要配置 DeepSeek API Key
+    const llmApiKey = llmProvider === "openrouter"
+      ? process.env.OPENROUTER_API_KEY
+      : process.env.DEEPSEEK_API_KEY;
     let llmSegments: any[] = [];
 
     if (llmApiKey && (llmProvider === "deepseek" || llmProvider === "openrouter")) {

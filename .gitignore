@@ -34,3 +34,6 @@ playwright-report/
 temp_*/
 temp/
 nul/
+
+# TypeScript incremental build cache
+*.tsbuildinfo

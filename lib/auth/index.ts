@@ -82,7 +82,9 @@ export const auth = betterAuth({
       clientSecret: process.env.GITHUB_CLIENT_SECRET!,
     },
     google: {
-      clientId: process.env.GOOGLE_CLIENT_ID!,
+      // Keep backward compatibility with the original public-prefixed variable,
+      // while preferring a server-only credential for new deployments.
+      clientId: (process.env.GOOGLE_CLIENT_ID || process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID)!,
       clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
     },
   },

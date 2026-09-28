@@ -5,26 +5,69 @@ import { extractR2Key, getFromR2, uploadToR2 } from "@/lib/cloudflare/r2";
 import { cleanupTempFiles } from "@/lib/video-processor";
 import { checkRateLimit, RateLimitConfigs } from "@/lib/utils/rate-limit";
 import ffmpeg from "fluent-ffmpeg";
+import ffmpegInstaller from "@ffmpeg-installer/ffmpeg";
 import path from "path";
 import fs from "fs/promises";
 import { randomUUID } from "crypto";
+import { assertSafeOutboundUrl } from "@/lib/utils/outbound-url";
 
-// 设置 FFmpeg 路径 - 指向 win32-x64 目录
-const ffmpegPath = path.join(
-  process.cwd(),
-  "node_modules",
-  ".pnpm",
-  "@ffmpeg-installer+win32-x64@4.1.0",
-  "node_modules",
-  "@ffmpeg-installer",
-  "win32-x64",
-  "ffmpeg.exe"
-);
-ffmpeg.setFfmpegPath(ffmpegPath);
+export const runtime = "nodejs";
+export const maxDuration = 300;
+
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
+
+const MAX_SOURCE_BYTES = 200 * 1024 * 1024;
+const MAX_SEGMENTS = 20;
+const MAX_SEGMENT_DURATION_SECONDS = 10 * 60;
 
 interface ClipSegment {
   start: number;
   end: number;
+}
+
+function normalizeSegments(value: unknown): ClipSegment[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_SEGMENTS) return null;
+  const segments = value.map((segment) => ({
+    start: Number(segment?.start),
+    end: Number(segment?.end),
+  }));
+  return segments.every(
+    ({ start, end }) =>
+      Number.isFinite(start) &&
+      Number.isFinite(end) &&
+      start >= 0 &&
+      end > start &&
+      end - start <= MAX_SEGMENT_DURATION_SECONDS,
+  )
+    ? segments
+    : null;
+}
+
+async function downloadWithLimit(url: string): Promise<Buffer> {
+  const response = await fetch(url, { redirect: "error", signal: AbortSignal.timeout(120_000) });
+  if (!response.ok || !response.body) {
+    throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
+  }
+
+  const declaredLength = Number(response.headers.get("content-length"));
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_SOURCE_BYTES) {
+    throw new Error("Source video is too large. Maximum size is 200MB");
+  }
+
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > MAX_SOURCE_BYTES) {
+      await reader.cancel();
+      throw new Error("Source video is too large. Maximum size is 200MB");
+    }
+    chunks.push(Buffer.from(value));
+  }
+  return Buffer.concat(chunks, total);
 }
 
 export async function POST(request: NextRequest) {
@@ -37,10 +80,24 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const body = await request.json();
-    const { mediaUrl, segments, outputFormat = "merge" } = body;
+    const { allowed, resetIn } = checkRateLimit(
+      `audio-clip:${session.user.id}`,
+      3,
+      RateLimitConfigs.analyze.windowMs,
+    );
+    if (!allowed) {
+      return NextResponse.json(
+        { error: "请求过于频繁，请稍后再试", retryAfter: Math.ceil(resetIn / 1000) },
+        { status: 429 },
+      );
+    }
 
-    if (!mediaUrl || !segments || !Array.isArray(segments) || segments.length === 0) {
+    const body = await request.json();
+    const mediaUrl = typeof body.mediaUrl === "string" ? body.mediaUrl : "";
+    const segments = normalizeSegments(body.segments);
+    const outputFormat = body.outputFormat === "multiple" ? "multiple" : "merge";
+
+    if (!mediaUrl || !segments) {
       return NextResponse.json(
         { error: "Missing mediaUrl or segments" },
         { status: 400 }
@@ -57,17 +114,20 @@ export async function POST(request: NextRequest) {
 
     const r2Key = extractR2Key(mediaUrl);
     if (r2Key) {
+      const ownerPrefix = `uploads/${encodeURIComponent(session.user.id)}/`;
+      if (!r2Key.startsWith(ownerPrefix)) {
+        return NextResponse.json({ error: "Media does not belong to the current user" }, { status: 403 });
+      }
       console.log("Reading from R2, key:", r2Key);
       videoBuffer = await getFromR2(r2Key);
+      if (videoBuffer.byteLength > MAX_SOURCE_BYTES) {
+        throw new Error("Source video is too large. Maximum size is 200MB");
+      }
     } else {
       // 直接从 URL 下载
-      console.log("Downloading video from URL:", mediaUrl);
-      const response = await fetch(mediaUrl);
-      if (!response.ok) {
-        throw new Error(`Failed to download video: ${response.status} ${response.statusText}`);
-      }
-      const arrayBuffer = await response.arrayBuffer();
-      videoBuffer = Buffer.from(arrayBuffer);
+      const safeUrl = await assertSafeOutboundUrl(mediaUrl, { fieldName: "Media URL" });
+      console.log("Downloading video from URL:", safeUrl.origin);
+      videoBuffer = await downloadWithLimit(safeUrl.toString());
     }
 
     await fs.writeFile(videoPath, videoBuffer);
@@ -75,16 +135,20 @@ export async function POST(request: NextRequest) {
     console.log(`Video downloaded, starting clip processing. Segments: ${segments.length}`);
 
     const mediaName = mediaUrl.split("/").pop() || "unknown";
-    const baseName = mediaName.replace(/\.[^/.]+$/, "");
+    const baseName = mediaName
+      .replace(/\?.*$/, "")
+      .replace(/\.[^/.]+$/, "")
+      .replace(/[^a-zA-Z0-9_-]+/g, "-")
+      .slice(0, 80) || "video";
 
     let outputVideoUrl: string;
 
     if (outputFormat === "merge") {
       // 合并所有片段为一个视频
-      outputVideoUrl = await mergeSegments(videoPath, segments, tempDir, baseName);
+      outputVideoUrl = await mergeSegments(videoPath, segments, tempDir, baseName, session.user.id);
     } else {
       // 导出为多个独立视频文件
-      const clipUrls = await exportMultipleClips(videoPath, segments, tempDir, baseName);
+      const clipUrls = await exportMultipleClips(videoPath, segments, tempDir, baseName, session.user.id);
       outputVideoUrl = clipUrls[0]; // 返回第一个
     }
 
@@ -139,7 +203,8 @@ async function mergeSegments(
   videoPath: string,
   segments: ClipSegment[],
   outputDir: string,
-  baseName: string
+  baseName: string,
+  userId: string,
 ): Promise<string> {
   const outputPath = path.join(outputDir, `${baseName}_clip.mp4`);
 
@@ -168,7 +233,7 @@ async function mergeSegments(
 
   // 上传到 R2
   const outputBuffer = await fs.readFile(outputPath);
-  const outputKey = `clips/${randomUUID()}_${baseName}_clip.mp4`;
+  const outputKey = `clips/${encodeURIComponent(userId)}/${randomUUID()}_${baseName}_clip.mp4`;
   const outputUrl = await uploadToR2(outputBuffer, outputKey, "video/mp4");
 
   return outputUrl;
@@ -181,7 +246,8 @@ async function exportMultipleClips(
   videoPath: string,
   segments: ClipSegment[],
   outputDir: string,
-  baseName: string
+  baseName: string,
+  userId: string,
 ): Promise<string[]> {
   const clipUrls: string[] = [];
 
@@ -193,7 +259,7 @@ async function exportMultipleClips(
 
     // 上传到 R2
     const outputBuffer = await fs.readFile(clipPath);
-    const outputKey = `clips/${randomUUID()}_${baseName}_clip_${i}.mp4`;
+    const outputKey = `clips/${encodeURIComponent(userId)}/${randomUUID()}_${baseName}_clip_${i}.mp4`;
     const outputUrl = await uploadToR2(outputBuffer, outputKey, "video/mp4");
 
     clipUrls.push(outputUrl);

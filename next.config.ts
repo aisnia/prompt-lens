@@ -4,6 +4,9 @@ const withNextIntl = createNextIntlPlugin("./i18n/request.ts");
 
 /** @type {import('next').NextConfig} */
 const nextConfig = {
+  // These packages locate and execute a platform-specific binary at runtime.
+  // Bundling them rewrites __dirname and makes the FFmpeg executable disappear.
+  serverExternalPackages: ["@ffmpeg-installer/ffmpeg", "fluent-ffmpeg"],
   images: {
     remotePatterns: [
       {
