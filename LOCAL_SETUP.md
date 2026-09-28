@@ -209,7 +209,7 @@ node scripts/setup-r2-cors.mjs
 
 ## 五、配置 Google 登录（可跳过）
 
-> **不想配 Google 登录可以跳过这步**，项目支持邮箱验证码登录（需要配 SMTP，见第七步）。
+> **不想配 Google 登录可以跳过这步**，也可以改用 GitHub 登录。
 >
 > 但建议配一下 Google 登录，体验更好。
 
@@ -328,7 +328,7 @@ NEXT_PUBLIC_BETTER_AUTH_URL=http://localhost:3000
 TRUSTED_ORIGINS=http://localhost:3000
 
 # ===== Google 登录（第五步，不配可留空）=====
-NEXT_PUBLIC_GOOGLE_CLIENT_ID=你的-google-client-id
+GOOGLE_CLIENT_ID=你的-google-client-id
 GOOGLE_CLIENT_SECRET=你的-google-client-secret
 
 # ===== Cloudflare R2（第四步拿到的）=====
@@ -349,13 +349,8 @@ ASSEMBLYAI_API_KEY=你的-assemblyai-key
 KIE_API_KEY=你的-kie-key
 DEEPSEEK_API_KEY=你的-deepseek-key
 
-# ===== 邮箱验证码登录（不用 Google 登录的话需要配）=====
-# 用 Gmail 的话：去 https://myaccount.google.com/apppasswords 生成一个应用专用密码
-SMTP_HOST=smtp.gmail.com
-SMTP_PORT=587
-SMTP_USER=你的-gmail-邮箱
-SMTP_PASS=你的-gmail-应用专用密码
-SMTP_FROM=PromptLens <你的-gmail-邮箱>
+# 仅当 FFmpeg/FunASR 服务位于本机或局域网时开启；公网部署请保持 false
+ALLOW_PRIVATE_SERVICE_URLS=false
 
 # ===== 管理员邮箱（可选，用于后台管理）=====
 ADMIN_EMAILS=你的邮箱@gmail.com

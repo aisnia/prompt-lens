@@ -22,6 +22,12 @@ function isAllowedFile(filename: string, mediaType: "video" | "image") {
   return allowed.includes(ext);
 }
 
+function isAllowedContentType(contentType: string, mediaType: "video" | "image") {
+  return mediaType === "video"
+    ? contentType.startsWith("video/")
+    : contentType.startsWith("image/");
+}
+
 function maxSizeBytes(mediaType: "video" | "image") {
   const mb = mediaType === "video" ? MAX_VIDEO_SIZE_MB : MAX_IMAGE_SIZE_MB;
   return mb * 1024 * 1024;
@@ -61,12 +67,17 @@ export async function POST(request: NextRequest) {
       !body.filename ||
       !body.contentType ||
       typeof body.size !== "number" ||
+      !Number.isFinite(body.size) ||
+      body.size <= 0 ||
       (body.mediaType !== "video" && body.mediaType !== "image")
     ) {
       return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
     }
 
-    if (!isAllowedFile(body.filename, body.mediaType)) {
+    if (
+      !isAllowedFile(body.filename, body.mediaType) ||
+      !isAllowedContentType(body.contentType, body.mediaType)
+    ) {
       return NextResponse.json({ error: "Invalid file type" }, { status: 400 });
     }
 
@@ -79,7 +90,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const key = `uploads/${body.mediaType}/${crypto.randomUUID()}-${safeFilename(body.filename)}`;
+    const owner = encodeURIComponent(session.user.id);
+    const key = `uploads/${owner}/${body.mediaType}/${crypto.randomUUID()}-${safeFilename(body.filename)}`;
     const publicUrl = getR2PublicUrl(key);
     const presignedUrl = await getPresignedUploadUrl(key, body.contentType, 600);
 
